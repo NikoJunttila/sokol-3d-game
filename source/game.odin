@@ -51,6 +51,16 @@ Game_Memory :: struct {
 	mouse_locked: bool,
 	last_mouse_x, last_mouse_y: f32,
 	first_mouse: bool,
+
+	// Player model
+	player_bind: sg.Bindings,
+	player_indices_count: int,
+	
+	// Player state
+	player_pos: Vec3,
+	player_vel: Vec3,
+	player_rot: f32,
+	on_ground: bool,
 }
 
 Mat4 :: matrix[4,4]f32
@@ -92,9 +102,15 @@ game_init :: proc() {
 	g.camera_front = {0.0, 0.0, -1.0}
 	g.camera_up = {0.0, 1.0, 0.0}
 	g.yaw = -90.0
-	g.pitch = 0.0
+	g.pitch = -20.0 // Look down slightly
 	g.first_mouse = true
 	g.mouse_locked = false
+	
+	// Initialize player
+	g.player_pos = {0.0, -2.0, 0.0}
+	g.player_vel = {0.0, 0.0, 0.0}
+	g.player_rot = 0.0
+	g.on_ground = true
 
 	// The remainder of this proc just sets up a sample cube and loads the
 	// texture to put on the cube's sides.
@@ -189,6 +205,52 @@ game_init :: proc() {
 	// a sampler with default options to sample the above image as texture
 	g.bind.samplers[SMP_smp] = sg.make_sampler({})
 
+	// Load player model
+	if mesh, ok := load_obj("assets/cat.obj"); ok {
+		g.player_indices_count = len(mesh.indices)
+		
+		g.player_bind.vertex_buffers[0] = sg.make_buffer({
+			data = { ptr = raw_data(mesh.vertices), size = uint(len(mesh.vertices) * size_of(Vertex)) },
+		})
+		
+		g.player_bind.index_buffer = sg.make_buffer({
+			usage = { index_buffer = true },
+			data = { ptr = raw_data(mesh.indices), size = uint(len(mesh.indices) * size_of(u16)) },
+		})
+
+		// Load player texture (try png first, fallback to existing if needed)
+		// Assuming user converted it or we use round_cat.png as placeholder if missing
+		// But let's try to load Cat_diffuse.png if it exists, otherwise round_cat.png
+		
+		tex_path := "assets/Cat_diffuse.png"
+		// Simple check if file exists by trying to read it (inefficient but simple here)
+		// Actually read_entire_file returns bool
+		
+		if img_data, img_data_ok := read_entire_file(tex_path, context.temp_allocator); img_data_ok {
+			if img, img_err := png.load_from_bytes(img_data, allocator = context.temp_allocator); img_err == nil {
+				sg_img := sg.make_image({
+					width = i32(img.width),
+					height = i32(img.height),
+					data = { mip_levels = { 0 = { ptr = raw_data(img.pixels.buf), size = uint(slice.size(img.pixels.buf[:])) } } },
+				})
+				g.player_bind.views[VIEW_tex] = sg.make_view({ texture = sg.Texture_View_Desc({image = sg_img}) })
+			} else {
+				log.error(img_err)
+			}
+		} else {
+			// Fallback to round_cat.png (already loaded in g.bind, but we need it in player_bind)
+			// We can reuse the image handle if we stored it, but we didn't.
+			// So let's just load round_cat.png again for simplicity or assume user provided the file.
+			// For now, let's just use the same texture as the cube if the specific one fails?
+			// Actually, let's just copy the view from g.bind if we want to reuse
+			g.player_bind.views[VIEW_tex] = g.bind.views[VIEW_tex]
+		}
+		
+		g.player_bind.samplers[SMP_smp] = sg.make_sampler({})
+	} else {
+		log.error("Failed to load assets/cat.obj")
+	}
+
 	// shader and pipeline object
 	g.pip = sg.make_pipeline({
 		shader = sg.make_shader(texcube_shader_desc(sg.query_backend())),
@@ -214,36 +276,83 @@ game_frame :: proc() {
 	g.rx += 60 * dt
 	g.ry += 120 * dt
 
-	// Camera movement
-	camera_speed := 5.0 * dt
-	if g.keys[.W] {
-		g.camera_pos += camera_speed * g.camera_front
+	// --- Player Physics & Movement ---
+	
+	// Gravity
+	GRAVITY :: 20.0
+	g.player_vel.y -= GRAVITY * dt
+
+	// Movement Input
+	move_speed: f32 = 10.0
+	move_dir: Vec3 = {0, 0, 0}
+	
+	// Calculate forward/right vectors relative to camera (ignoring Y)
+	cam_forward := g.camera_front
+	cam_forward.y = 0
+	cam_forward = linalg.normalize(cam_forward)
+	
+	cam_right := linalg.normalize(linalg.cross(cam_forward, Vec3{0, 1, 0}))
+
+	if g.keys[.W] { move_dir += cam_forward }
+	if g.keys[.S] { move_dir -= cam_forward }
+	if g.keys[.A] { move_dir -= cam_right }
+	if g.keys[.D] { move_dir += cam_right }
+
+	if linalg.length(move_dir) > 0.1 {
+		move_dir = linalg.normalize(move_dir)
+		g.player_pos.x += move_dir.x * move_speed * dt
+		g.player_pos.z += move_dir.z * move_speed * dt
+		
+		// Rotate player to face movement direction
+		// atan2 returns angle in radians from X axis, we want rotation around Y
+		// We need to map (x, z) to angle.
+		// standard atan2(y, x) -> here atan2(x, z) or similar
+		target_rot := linalg.to_degrees(linalg.atan2(move_dir.x, move_dir.z))
+		
+		// Smooth rotation could be added here, but instant snap for now
+		g.player_rot = target_rot
 	}
-	if g.keys[.S] {
-		g.camera_pos -= camera_speed * g.camera_front
-	}
-	if g.keys[.A] {
-		g.camera_pos -= linalg.normalize(linalg.cross(g.camera_front, g.camera_up)) * camera_speed
-	}
-	if g.keys[.D] {
-		g.camera_pos += linalg.normalize(linalg.cross(g.camera_front, g.camera_up)) * camera_speed
+	
+	// Apply vertical velocity
+	g.player_pos.y += g.player_vel.y * dt
+
+	// --- Collision Detection ---
+	
+	// Floor constraint (floor is at y=-2.0)
+	// Assuming player origin is at feet
+	if g.player_pos.y < -2.0 {
+		g.player_pos.y = -2.0
+		g.player_vel.y = 0
+		g.on_ground = true
+	} else {
+		g.on_ground = false
 	}
 
-	// Collision Detection
-	// Floor constraint (floor is at y=-2.0, keep camera above -1.0)
-	if g.camera_pos.y < -1.0 {
-		g.camera_pos.y = -1.0
-	}
+	// Wall constraints (walls are at +/- 20.0, keep player within +/- 18.0)
+	if g.player_pos.x > 18.0 { g.player_pos.x = 18.0 }
+	if g.player_pos.x < -18.0 { g.player_pos.x = -18.0 }
+	if g.player_pos.z > 18.0 { g.player_pos.z = 18.0 }
+	if g.player_pos.z < -18.0 { g.player_pos.z = -18.0 }
 
-	// Wall constraints (walls are at +/- 20.0, keep camera within +/- 18.0)
-	if g.camera_pos.x > 18.0 { g.camera_pos.x = 18.0 }
-	if g.camera_pos.x < -18.0 { g.camera_pos.x = -18.0 }
-	if g.camera_pos.z > 18.0 { g.camera_pos.z = 18.0 }
-	if g.camera_pos.z < -18.0 { g.camera_pos.z = -18.0 }
-
+	// --- Camera Follow ---
+	
+	// Camera orbits around player
+	camera_dist: f32 = 8.0
+	camera_height: f32 = 3.0 // Height offset from player
+	
+	// Target point is player position + height
+	target := g.player_pos
+	target.y += 1.5 // Look at head/center
+	
+	// Camera position based on orbit angles (yaw/pitch)
+	// We already update camera_front based on mouse input in game_event
+	// So we just place camera backwards from target along that vector
+	
+	g.camera_pos = target - (g.camera_front * camera_dist)
+	
 	// Calculate View-Projection Matrix
 	proj := linalg.matrix4_perspective(60.0 * linalg.RAD_PER_DEG, sapp.widthf() / sapp.heightf(), 0.01, 100.0)
-	view := linalg.matrix4_look_at_f32(g.camera_pos, g.camera_pos + g.camera_front, g.camera_up)
+	view := linalg.matrix4_look_at_f32(g.camera_pos, target, g.camera_up)
 	view_proj := proj * view
 
 	pass_action := sg.Pass_Action {
@@ -256,7 +365,7 @@ game_frame :: proc() {
 	sg.apply_pipeline(g.pip)
 	sg.apply_bindings(g.bind)
 
-	// Draw Rotating Cube
+	// Draw Rotating Cube (keep it as a landmark)
 	rxm := linalg.matrix4_rotate_f32(g.rx * linalg.RAD_PER_DEG, {1.0, 0.0, 0.0})
 	rym := linalg.matrix4_rotate_f32(g.ry * linalg.RAD_PER_DEG, {0.0, 1.0, 0.0})
 	model_cube := rxm * rym
@@ -301,6 +410,23 @@ game_frame :: proc() {
 	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_w, size = size_of(vs_params_wall_w) })
 	sg.draw(0, 36, 1)
 
+	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_w, size = size_of(vs_params_wall_w) })
+	sg.draw(0, 36, 1)
+
+	// Draw Player Model
+	if g.player_indices_count > 0 {
+		sg.apply_bindings(g.player_bind)
+		
+		// Render player at player_pos with player_rot
+		model_player := linalg.matrix4_translate_f32(g.player_pos) * 
+						linalg.matrix4_rotate_f32(g.player_rot * linalg.RAD_PER_DEG, {0, 1, 0}) * 
+						linalg.matrix4_scale_f32({0.1, 0.1, 0.1})
+		
+		vs_params_player := Vs_Params { mvp = view_proj * model_player }
+		sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_player, size = size_of(vs_params_player) })
+		sg.draw(0, g.player_indices_count, 1)
+	}
+
 	sg.end_pass()
 	sg.commit()
 
@@ -324,6 +450,10 @@ game_event :: proc(e: ^sapp.Event) {
 			g.mouse_locked = !g.mouse_locked
 			sapp.lock_mouse(g.mouse_locked)
 			g.first_mouse = true
+		}
+		
+		if e.key_code == .SPACE && g.on_ground {
+			g.player_vel.y = 10.0 // Jump force
 		}
 
 	case .KEY_UP:
