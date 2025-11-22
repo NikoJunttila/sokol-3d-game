@@ -38,6 +38,7 @@ import sdt "sokol/debugtext"
 
 Game_Memory :: struct {
 	pip: sg.Pipeline,
+	pip_skinned: sg.Pipeline,
 	bind: sg.Bindings,
 	rx, ry: f32,
 	
@@ -61,6 +62,7 @@ Game_Memory :: struct {
 	player_pos: Vec3,
 	player_vel: Vec3,
 	player_rot: f32,
+	player_scale: f32,
 	on_ground: bool,
 	
 	// Map system
@@ -68,7 +70,15 @@ Game_Memory :: struct {
 	edit_mode: bool,
 	selected_type: Map_Object_Type,
 	placement_rot: f32,
+	
+	// Animation
+	animated_model: Animated_Model,
+	anim_time: f32,
+	current_anim: int,
+	joint_matrices: [64]matrix[4,4]f32,
 }
+
+
 
 Mat4 :: matrix[4,4]f32
 Vec3 :: [3]f32
@@ -117,6 +127,7 @@ game_init :: proc() {
 	g.player_pos = {0.0, -2.0, 0.0}
 	g.player_vel = {0.0, 0.0, 0.0}
 	g.player_rot = 0.0
+	g.player_scale = 0.5
 	g.on_ground = true
 	
 	// Initialize map
@@ -272,8 +283,43 @@ game_init :: proc() {
 	} else {
 		log.error("Failed to load assets/cat.obj")
 	}
+	
+	// Load animated model
+	if model, ok := load_gltf("assets/cat_model.glb"); ok {
+		g.animated_model = model
+		g.current_anim = 0 // Default animation
+		
+		// Create buffers for animated model
+		// We need to repack vertices to match shader layout if needed, but our Skinned_Vertex matches
+		// Layout: pos(0), color(1), uv(2), joints(3), weights(4)
+		// Wait, Skinned_Vertex has pos, norm, uv, joints, weights.
+		// Shader expects: pos(0), color0(1), texcoord0(2), joints(3), weights(4)
+		// We don't have color in Skinned_Vertex, but we have norm.
+		// We should probably update shader to use norm or just ignore color.
+		// Or we can map norm to color for debugging?
+		// Let's update pipeline layout below.
+		
+		g.player_bind.vertex_buffers[0] = sg.make_buffer({
+			data = { ptr = raw_data(model.vertices), size = uint(len(model.vertices) * size_of(Skinned_Vertex)) },
+		})
+		
+		g.player_bind.index_buffer = sg.make_buffer({
+			usage = { index_buffer = true },
+			data = { ptr = raw_data(model.indices), size = uint(len(model.indices) * size_of(u16)) },
+		})
+		
+		// Reuse texture view
+		g.player_bind.views[VIEW_tex] = g.bind.views[VIEW_tex] // Or load specific texture
+		g.player_bind.samplers[SMP_smp] = sg.make_sampler({})
+		
+	} else {
+		log.error("Failed to load assets/cat_model.glb")
+	}
 
 	// shader and pipeline object
+	
+	// Original Shader for Static Meshes (Map, Cube)
+	// Use the generated shader description which handles multiple backends
 	g.pip = sg.make_pipeline({
 		shader = sg.make_shader(texcube_shader_desc(sg.query_backend())),
 		layout = {
@@ -281,6 +327,26 @@ game_init :: proc() {
 				ATTR_texcube_pos = { format = .FLOAT3 },
 				ATTR_texcube_color0 = { format = .UBYTE4N },
 				ATTR_texcube_texcoord0 = { format = .SHORT2N },
+			},
+		},
+		index_type = .UINT16,
+		cull_mode = .BACK,
+		depth = {
+			compare = .LESS_EQUAL,
+			write_enabled = true,
+		},
+	})
+
+	// Skinning Shader for Animated Player
+	g.pip_skinned = sg.make_pipeline({
+		shader = sg.make_shader(skinned_shader_desc(sg.query_backend())),
+		layout = {
+			attrs = {
+				ATTR_skinned_pos = { format = .FLOAT3 },
+				ATTR_skinned_color0 = { format = .FLOAT3 }, // color/norm
+				ATTR_skinned_texcoord0 = { format = .FLOAT2 },
+				ATTR_skinned_joints = { format = .FLOAT4 },
+				ATTR_skinned_weights = { format = .FLOAT4 },
 			},
 		},
 		index_type = .UINT16,
@@ -309,6 +375,82 @@ game_frame :: proc() {
 	dt := f32(sapp.frame_duration())
 	g.rx += 60 * dt
 	g.ry += 120 * dt
+	
+	// --- Animation Update ---
+	if len(g.animated_model.animations) > 0 {
+		anim := &g.animated_model.animations[g.current_anim]
+		g.anim_time += dt
+		if g.anim_time > anim.duration {
+			g.anim_time = 0 // Loop
+		}
+		
+		// Sample channels
+		for ch in anim.channels {
+			// Simple linear search for keyframes (optimize later)
+			// Input times
+			times := ch.sampler.input
+			values := ch.sampler.output
+			
+			// Find frame
+			frame := 0
+			for i := 0; i < len(times)-1; i += 1 {
+				if g.anim_time >= times[i] && g.anim_time < times[i+1] {
+					frame = i
+					break
+				}
+			}
+			
+			next_frame := frame + 1
+			if next_frame >= len(times) { next_frame = frame }
+			
+			t0 := times[frame]
+			t1 := times[next_frame]
+			factor := (g.anim_time - t0) / (t1 - t0)
+			if t1 == t0 { factor = 0 }
+			
+			node := &g.animated_model.nodes[ch.node_index]
+			
+			if ch.path == .translation {
+				idx0 := frame * 3
+				idx1 := next_frame * 3
+				v0 := Vec3{values[idx0], values[idx0+1], values[idx0+2]}
+				v1 := Vec3{values[idx1], values[idx1+1], values[idx1+2]}
+				node.translation = linalg.lerp(v0, v1, factor)
+			} else if ch.path == .rotation {
+				idx0 := frame * 4
+				idx1 := next_frame * 4
+				q0 := quaternion(w=values[idx0+3], x=values[idx0], y=values[idx0+1], z=values[idx0+2])
+				q1 := quaternion(w=values[idx1+3], x=values[idx1], y=values[idx1+1], z=values[idx1+2])
+				res_q := linalg.quaternion_nlerp(q0, q1, factor)
+				node.rotation = {res_q.x, res_q.y, res_q.z, res_q.w}
+			} else if ch.path == .scale {
+				idx0 := frame * 3
+				idx1 := next_frame * 3
+				v0 := Vec3{values[idx0], values[idx0+1], values[idx0+2]}
+				v1 := Vec3{values[idx1], values[idx1+1], values[idx1+2]}
+				node.scale = linalg.lerp(v0, v1, factor)
+			}
+		}
+		
+		// Update global matrices
+		// Assuming root nodes are those with parent == -1
+		for i := 0; i < len(g.animated_model.nodes); i += 1 {
+			if g.animated_model.nodes[i].parent == -1 {
+				update_node_hierarchy(&g.animated_model, i, linalg.MATRIX4F32_IDENTITY)
+			}
+		}
+		
+		// Compute joint matrices for skinning
+		if len(g.animated_model.skins) > 0 {
+			skin := &g.animated_model.skins[0] // Assume single skin
+			for i := 0; i < len(skin.joints) && i < 64; i += 1 {
+				joint_node_idx := skin.joints[i]
+				node := &g.animated_model.nodes[joint_node_idx]
+				inv_bind := skin.inverse_bind_matrices[i]
+				g.joint_matrices[i] = node.global_matrix * inv_bind
+			}
+		}
+	}
 
 	// --- Player Physics & Movement ---
 	
@@ -373,7 +515,6 @@ game_frame :: proc() {
 	for obj in g.current_map.objects {
 		// Simple AABB check (ignoring rotation for collision simplicity)
 		// Calculate bounds
-		half_scale := obj.scale * 0.5 // Assuming cube is 2x2x2 base? No, base cube is 2x2x2 (-1 to 1)
 		// Actually base cube vertices are -1 to 1, so size is 2.
 		// So scale of 1 means size 2.
 		// Half extents = scale * 1.0
@@ -418,7 +559,6 @@ game_frame :: proc() {
 	
 	// Camera orbits around player
 	camera_dist: f32 = 8.0
-	camera_height: f32 = 3.0 // Height offset from player
 	
 	// Target point is player position + height
 	target := g.player_pos
@@ -496,16 +636,20 @@ game_frame :: proc() {
 
 	// Draw Player Model
 	if g.player_indices_count > 0 {
+		sg.apply_pipeline(g.pip_skinned)
 		sg.apply_bindings(g.player_bind)
 		
 		// Render player at player_pos with player_rot
 		model_player := linalg.matrix4_translate_f32(g.player_pos) * 
 						linalg.matrix4_rotate_f32(g.player_rot * linalg.RAD_PER_DEG, {0, 1, 0}) * 
-						linalg.matrix4_scale_f32({0.1, 0.1, 0.1})
+						linalg.matrix4_scale_f32({g.player_scale, g.player_scale, g.player_scale})
 		
-		vs_params_player := Vs_Params { mvp = view_proj * model_player }
-		sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_player, size = size_of(vs_params_player) })
-		sg.draw(0, g.player_indices_count, 1)
+		vs_params_player := Vs_Params_Skinned { 
+			mvp = view_proj * model_player,
+			joint_matrices = g.joint_matrices,
+		}
+		sg.apply_uniforms(UB_vs_params_skinned, { ptr = &vs_params_player, size = size_of(vs_params_player) })
+		sg.draw(0, g.player_indices_count, 1) // Use count from animated model if loaded
 	}
 
 	// --- UI Text Rendering ---
@@ -702,3 +846,20 @@ game_force_restart :: proc() -> bool {
 	return force_reset
 }
 
+
+update_node_hierarchy :: proc(model: ^Animated_Model, node_idx: int, parent_mat: Mat4) {
+	node := &model.nodes[node_idx]
+	
+	// Recompose local matrix
+	t := linalg.matrix4_translate_f32(node.translation)
+	q := quaternion(w=node.rotation[3], x=node.rotation[0], y=node.rotation[1], z=node.rotation[2])
+	r := linalg.matrix4_from_quaternion_f32(q)
+	s := linalg.matrix4_scale_f32(node.scale)
+	
+	node.local_matrix = t * r * s
+	node.global_matrix = parent_mat * node.local_matrix
+	
+	for child_idx in node.children {
+		update_node_hierarchy(model, child_idx, node.global_matrix)
+	}
+}

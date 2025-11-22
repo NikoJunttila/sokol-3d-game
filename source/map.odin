@@ -1,10 +1,8 @@
 package game
 
 import "core:fmt"
-import "core:os"
 import "core:strings"
 import "core:strconv"
-import "core:log"
 
 Map_Object_Type :: enum {
 	Floor,
@@ -50,8 +48,8 @@ load_map :: proc(filename: string) -> (Map, bool) {
 	m: Map
 
 	it := content
-	for line in strings.split_iterator(&it, "\n") {
-		line := strings.trim_space(line)
+	for raw_line in strings.split_iterator(&it, "\n") {
+		line := strings.trim_space(raw_line)
 		if len(line) == 0 {
 			continue
 		}

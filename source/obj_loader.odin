@@ -1,7 +1,5 @@
 package game
 
-import "core:fmt"
-import "core:os"
 import "core:strings"
 import "core:strconv"
 import "core:log"
@@ -33,8 +31,8 @@ load_obj :: proc(filename: string) -> (Mesh, bool) {
 	defer delete(unique_vertices)
 
 	it := content
-	for line in strings.split_iterator(&it, "\n") {
-		line := strings.trim_space(line)
+	for raw_line in strings.split_iterator(&it, "\n") {
+		line := strings.trim_space(raw_line)
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
@@ -74,7 +72,7 @@ load_obj :: proc(filename: string) -> (Mesh, bool) {
 
 			for i := 1; i < len(parts); i += 1 {
 				key := parts[i]
-				if idx, ok := unique_vertices[key]; ok {
+				if idx, exists := unique_vertices[key]; exists {
 					append(&face_indices, idx)
 				} else {
 					// Parse index triplet
