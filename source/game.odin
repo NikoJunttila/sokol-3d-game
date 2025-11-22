@@ -34,6 +34,7 @@ import sapp "sokol/app"
 import sg "sokol/gfx"
 import sglue "sokol/glue"
 import slog "sokol/log"
+import sdt "sokol/debugtext"
 
 Game_Memory :: struct {
 	pip: sg.Pipeline,
@@ -61,6 +62,12 @@ Game_Memory :: struct {
 	player_vel: Vec3,
 	player_rot: f32,
 	on_ground: bool,
+	
+	// Map system
+	current_map: Map,
+	edit_mode: bool,
+	selected_type: Map_Object_Type,
+	placement_rot: f32,
 }
 
 Mat4 :: matrix[4,4]f32
@@ -111,6 +118,21 @@ game_init :: proc() {
 	g.player_vel = {0.0, 0.0, 0.0}
 	g.player_rot = 0.0
 	g.on_ground = true
+	
+	// Initialize map
+	if m, ok := load_map("assets/level1.map"); ok {
+		g.current_map = m
+	} else {
+		// Create default map if load fails
+		append(&g.current_map.objects, Map_Object{type = .Floor, pos = {0, -2, 0}, scale = {20, 0.1, 20}})
+		// Walls
+		append(&g.current_map.objects, Map_Object{type = .Wall, pos = {0, 0, 20}, scale = {20, 2, 1}})
+		append(&g.current_map.objects, Map_Object{type = .Wall, pos = {0, 0, -20}, scale = {20, 2, 1}})
+		append(&g.current_map.objects, Map_Object{type = .Wall, pos = {20, 0, 0}, scale = {1, 2, 20}})
+		append(&g.current_map.objects, Map_Object{type = .Wall, pos = {-20, 0, 0}, scale = {1, 2, 20}})
+	}
+	
+	g.selected_type = .Wall
 
 	// The remainder of this proc just sets up a sample cube and loads the
 	// texture to put on the cube's sides.
@@ -268,6 +290,18 @@ game_init :: proc() {
 			write_enabled = true,
 		},
 	})
+
+	// Initialize sokol_debugtext
+	sdt.setup({
+		fonts = {
+			0 = sdt.font_kc853(),
+			1 = sdt.font_kc854(),
+			2 = sdt.font_z1013(),
+			3 = sdt.font_cpc(),
+			4 = sdt.font_c64(),
+			5 = sdt.font_oric(),
+		},
+	})
 }
 
 @export
@@ -318,21 +352,67 @@ game_frame :: proc() {
 
 	// --- Collision Detection ---
 	
-	// Floor constraint (floor is at y=-2.0)
-	// Assuming player origin is at feet
+	// Simple AABB collision against map objects
+	// We check if player is inside any wall object
+	// Floor collision is still hardcoded to -2.0 for base floor, but we should check map floors too
+	
+	// Reset on_ground
+	g.on_ground = false
+	
+	// Base floor check (keep as fallback)
 	if g.player_pos.y < -2.0 {
 		g.player_pos.y = -2.0
 		g.player_vel.y = 0
 		g.on_ground = true
-	} else {
-		g.on_ground = false
 	}
-
-	// Wall constraints (walls are at +/- 20.0, keep player within +/- 18.0)
-	if g.player_pos.x > 18.0 { g.player_pos.x = 18.0 }
-	if g.player_pos.x < -18.0 { g.player_pos.x = -18.0 }
-	if g.player_pos.z > 18.0 { g.player_pos.z = 18.0 }
-	if g.player_pos.z < -18.0 { g.player_pos.z = -18.0 }
+	
+	// Check against map objects
+	player_radius: f32 = 0.5
+	player_height: f32 = 1.0
+	
+	for obj in g.current_map.objects {
+		// Simple AABB check (ignoring rotation for collision simplicity)
+		// Calculate bounds
+		half_scale := obj.scale * 0.5 // Assuming cube is 2x2x2 base? No, base cube is 2x2x2 (-1 to 1)
+		// Actually base cube vertices are -1 to 1, so size is 2.
+		// So scale of 1 means size 2.
+		// Half extents = scale * 1.0
+		
+		min_bound := obj.pos - obj.scale
+		max_bound := obj.pos + obj.scale
+		
+		// Check if player is intersecting
+		if g.player_pos.x + player_radius > min_bound.x && g.player_pos.x - player_radius < max_bound.x &&
+		   g.player_pos.z + player_radius > min_bound.z && g.player_pos.z - player_radius < max_bound.z {
+			
+			// Vertical check
+			if g.player_pos.y < max_bound.y && g.player_pos.y + player_height > min_bound.y {
+				// Collision detected
+				if obj.type == .Floor {
+					// Land on top
+					if g.player_vel.y <= 0 && g.player_pos.y >= max_bound.y - 0.5 {
+						g.player_pos.y = max_bound.y
+						g.player_vel.y = 0
+						g.on_ground = true
+					}
+				} else if obj.type == .Wall {
+					// Push out horizontally
+					// Determine closest face
+					dx_pos := abs(g.player_pos.x - max_bound.x)
+					dx_neg := abs(g.player_pos.x - min_bound.x)
+					dz_pos := abs(g.player_pos.z - max_bound.z)
+					dz_neg := abs(g.player_pos.z - min_bound.z)
+					
+					min_d := min(dx_pos, min(dx_neg, min(dz_pos, dz_neg)))
+					
+					if min_d == dx_pos { g.player_pos.x = max_bound.x + player_radius }
+					else if min_d == dx_neg { g.player_pos.x = min_bound.x - player_radius }
+					else if min_d == dz_pos { g.player_pos.z = max_bound.z + player_radius }
+					else if min_d == dz_neg { g.player_pos.z = min_bound.z - player_radius }
+				}
+			}
+		}
+	}
 
 	// --- Camera Follow ---
 	
@@ -376,42 +456,43 @@ game_frame :: proc() {
 	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_cube, size = size_of(vs_params_cube) })
 	sg.draw(0, 36, 1)
 
-	// Draw Ground
-	model_ground := linalg.matrix4_translate_f32({0.0, -2.0, 0.0}) * linalg.matrix4_scale_f32({20.0, 0.1, 20.0})
-	
-	vs_params_ground := Vs_Params {
-		mvp = view_proj * model_ground,
+	// Draw Map Objects
+	for obj in g.current_map.objects {
+		model := linalg.matrix4_translate_f32(obj.pos) * 
+				 linalg.matrix4_rotate_f32(obj.rot.y * linalg.RAD_PER_DEG, {0, 1, 0}) * 
+				 linalg.matrix4_scale_f32(obj.scale)
+		
+		vs_params := Vs_Params { mvp = view_proj * model }
+		sg.apply_uniforms(UB_vs_params, { ptr = &vs_params, size = size_of(vs_params) })
+		sg.draw(0, 36, 1)
 	}
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_ground, size = size_of(vs_params_ground) })
-	sg.draw(0, 36, 1)
+	
+	// Editor Preview
+	if g.edit_mode {
+		// Calculate placement position (snap to grid)
+		snap_size: f32 = 2.0
+		place_pos := g.player_pos + (g.camera_front * 5.0)
+		place_pos.x = f32(int(place_pos.x / snap_size)) * snap_size
+		place_pos.y = f32(int(place_pos.y / snap_size)) * snap_size
+		place_pos.z = f32(int(place_pos.z / snap_size)) * snap_size
+		
+		// Default scale based on type
+		scale: Vec3 = {1, 1, 1}
+		if g.selected_type == .Floor { scale = {2, 0.1, 2} }
+		if g.selected_type == .Wall { scale = {2, 2, 1} }
+		
+		model := linalg.matrix4_translate_f32(place_pos) * 
+				 linalg.matrix4_rotate_f32(g.placement_rot * linalg.RAD_PER_DEG, {0, 1, 0}) * 
+				 linalg.matrix4_scale_f32(scale)
+		
+		// Pulsing effect or color change could be added here via uniforms if supported
+		// For now just draw it
+		vs_params := Vs_Params { mvp = view_proj * model }
+		sg.apply_uniforms(UB_vs_params, { ptr = &vs_params, size = size_of(vs_params) })
+		sg.draw(0, 36, 1)
+	}
 
-	// Draw Walls
-	// North
-	model_wall_n := linalg.matrix4_translate_f32({0.0, 0.0, 20.0}) * linalg.matrix4_scale_f32({20.0, 2.0, 1.0})
-	vs_params_wall_n := Vs_Params { mvp = view_proj * model_wall_n }
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_n, size = size_of(vs_params_wall_n) })
-	sg.draw(0, 36, 1)
 
-	// South
-	model_wall_s := linalg.matrix4_translate_f32({0.0, 0.0, -20.0}) * linalg.matrix4_scale_f32({20.0, 2.0, 1.0})
-	vs_params_wall_s := Vs_Params { mvp = view_proj * model_wall_s }
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_s, size = size_of(vs_params_wall_s) })
-	sg.draw(0, 36, 1)
-
-	// East
-	model_wall_e := linalg.matrix4_translate_f32({20.0, 0.0, 0.0}) * linalg.matrix4_scale_f32({1.0, 2.0, 20.0})
-	vs_params_wall_e := Vs_Params { mvp = view_proj * model_wall_e }
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_e, size = size_of(vs_params_wall_e) })
-	sg.draw(0, 36, 1)
-
-	// West
-	model_wall_w := linalg.matrix4_translate_f32({-20.0, 0.0, 0.0}) * linalg.matrix4_scale_f32({1.0, 2.0, 20.0})
-	vs_params_wall_w := Vs_Params { mvp = view_proj * model_wall_w }
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_w, size = size_of(vs_params_wall_w) })
-	sg.draw(0, 36, 1)
-
-	sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_wall_w, size = size_of(vs_params_wall_w) })
-	sg.draw(0, 36, 1)
 
 	// Draw Player Model
 	if g.player_indices_count > 0 {
@@ -426,6 +507,49 @@ game_frame :: proc() {
 		sg.apply_uniforms(UB_vs_params, { ptr = &vs_params_player, size = size_of(vs_params_player) })
 		sg.draw(0, g.player_indices_count, 1)
 	}
+
+	// --- UI Text Rendering ---
+	// sdt.new_frame() // Not found in binding
+	
+	// Controls Help (Top Left)
+	sdt.font(4) // C64 style
+	sdt.color4f(1.0, 1.0, 1.0, 1.0)
+	sdt.pos(1, 1)
+	sdt.printf("Controls:")
+	sdt.pos(1, 2)
+	sdt.printf("WASD: Move")
+	sdt.pos(1, 3)
+	sdt.printf("Space: Jump")
+	sdt.pos(1, 4)
+	sdt.printf("Mouse: Look")
+	sdt.pos(1, 5)
+	sdt.printf("Tab: Toggle Mouse Lock")
+	sdt.pos(1, 6)
+	sdt.printf("F1: Toggle Edit Mode")
+	
+	// Editor Status (Top Right)
+	if g.edit_mode {
+		sdt.color4f(1.0, 0.2, 0.2, 1.0) // Red
+		sdt.pos(40, 1)
+		sdt.printf("EDIT MODE ACTIVE")
+		
+		sdt.color4f(1.0, 1.0, 1.0, 1.0)
+		sdt.pos(40, 2)
+		sdt.printf("1: Floor, 2: Wall")
+		sdt.pos(40, 3)
+		sdt.printf("E: Place, Q: Undo")
+		sdt.pos(40, 4)
+		sdt.printf("R: Rotate")
+		sdt.pos(40, 5)
+		sdt.printf("F5: Save, F9: Load")
+		
+		sdt.pos(40, 7)
+		sdt.printf("Selected: ")
+		if g.selected_type == .Floor { sdt.printf("Floor") }
+		if g.selected_type == .Wall { sdt.printf("Wall") }
+	}
+
+	sdt.draw()
 
 	sg.end_pass()
 	sg.commit()
@@ -454,6 +578,57 @@ game_event :: proc(e: ^sapp.Event) {
 		
 		if e.key_code == .SPACE && g.on_ground {
 			g.player_vel.y = 10.0 // Jump force
+		}
+		
+		// Editor Controls
+		if e.key_code == .F1 {
+			g.edit_mode = !g.edit_mode
+			log.info("Edit Mode:", g.edit_mode)
+		}
+		
+		if g.edit_mode {
+			if e.key_code == ._1 { g.selected_type = .Floor }
+			if e.key_code == ._2 { g.selected_type = .Wall }
+			if e.key_code == .R { g.placement_rot += 90.0 }
+			
+			if e.key_code == .E {
+				// Place object
+				snap_size: f32 = 2.0
+				place_pos := g.player_pos + (g.camera_front * 5.0)
+				place_pos.x = f32(int(place_pos.x / snap_size)) * snap_size
+				place_pos.y = f32(int(place_pos.y / snap_size)) * snap_size
+				place_pos.z = f32(int(place_pos.z / snap_size)) * snap_size
+				
+				scale: Vec3 = {1, 1, 1}
+				if g.selected_type == .Floor { scale = {2, 0.1, 2} }
+				if g.selected_type == .Wall { scale = {2, 2, 1} }
+				
+				append(&g.current_map.objects, Map_Object{
+					type = g.selected_type,
+					pos = place_pos,
+					rot = {0, g.placement_rot, 0},
+					scale = scale,
+				})
+			}
+			
+			if e.key_code == .Q {
+				// Remove last object (simple undo for now)
+				if len(g.current_map.objects) > 0 {
+					pop(&g.current_map.objects)
+				}
+			}
+			
+			if e.key_code == .F5 {
+				save_map("assets/level1.map", g.current_map)
+				log.info("Map saved")
+			}
+			
+			if e.key_code == .F9 {
+				if m, ok := load_map("assets/level1.map"); ok {
+					g.current_map = m
+					log.info("Map loaded")
+				}
+			}
 		}
 
 	case .KEY_UP:
@@ -498,6 +673,7 @@ game_event :: proc(e: ^sapp.Event) {
 
 @export
 game_cleanup :: proc() {
+	sdt.shutdown()
 	sg.shutdown()
 	free(g)
 }
