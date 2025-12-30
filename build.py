@@ -307,7 +307,7 @@ def build_web():
 
 	# Note --preload-file assets, this bakes in the whole assets directory into
 	# the web build.
-	emcc_flags = "--shell-file source/web/index_template.html --preload-file assets -sWASM_BIGINT -sWARN_ON_UNDEFINED_SYMBOLS=0 -sMAX_WEBGL_VERSION=2 -sASSERTIONS"
+	emcc_flags = "--shell-file source/web/index_template.html --preload-file assets -sWASM_BIGINT -sWARN_ON_UNDEFINED_SYMBOLS=0 -sMAX_WEBGL_VERSION=2 -sASSERTIONS -Wl,--allow-multiple-definition -sINITIAL_MEMORY=67108864 -sALLOW_MEMORY_GROWTH=1"
 
 	build_flags = ""
 

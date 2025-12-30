@@ -27,6 +27,7 @@ main :: proc() {
 	app_desc.frame_cb = frame
 	app_desc.cleanup_cb = cleanup
 	app_desc.event_cb = event
+	app_desc.html5_canvas_selector = "#canvas"
 
 	// On web this will not block. Any line after this one will run immediately!
 	// Do any on-shutdown stuff in the `cleanup` proc.

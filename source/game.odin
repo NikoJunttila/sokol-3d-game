@@ -100,6 +100,7 @@ game_app_default_desc :: proc() -> sapp.Desc {
 		icon = { sokol_default = true },
 		logger = { func = slog.func },
 		html5_update_document_title = true,
+		html5_canvas_selector = "#canvas",
 	}
 }
 
